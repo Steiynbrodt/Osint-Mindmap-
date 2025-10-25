@@ -1,13 +1,18 @@
+#!/usr/bin/env python3
+# Orwellish — Local OSINT + D&D Node Editor (PySide6)
+# Shift-click to connect edges. Edges selectable/deletable. Tags isolated per-node.
 
 import json, os, re, sys, webbrowser
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any
+from PySide6.QtGui import QFontDatabase, QFont, QFontInfo
+import platform
 
 import requests, tldextract, validators, dns.resolver, whois
 from PySide6.QtCore import Qt, QPointF, QRectF, QMimeData, QUrl, QSize, QLineF, QTimer
 from PySide6.QtGui import (
     QAction, QBrush, QColor, QFont, QPainter, QPainterPath, QPen,
-    QPixmap, QPolygonF, QPalette, QKeySequence
+    QPixmap, QPolygonF, QPalette, QKeySequence, QPainterPathStroker
 )
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QGraphicsItem, QGraphicsPathItem, QGraphicsRectItem,
@@ -218,12 +223,22 @@ class EdgeItem(QGraphicsPathItem):
         self.src = srcItem
         self.dst = dstItem
         self.style = style
-        self.label = QGraphicsTextItem(label_text, self)
+
+        # selectable & hoverable
+        self.setFlag(QGraphicsItem.ItemIsSelectable, True)
+        self.setAcceptHoverEvents(True)
         self.setZValue(-1)
+
+        # pen + style
         self.pen = QPen(QColor("#9aa4b2" if IS_DARK else "#64748b"), 2)
-        if style == "dashed": self.pen.setStyle(Qt.DashLine)
-        elif style == "dotted": self.pen.setStyle(Qt.DotLine)
+        if style == "dashed":
+            self.pen.setStyle(Qt.DashLine)
+        elif style == "dotted":
+            self.pen.setStyle(Qt.DotLine)
         self.setPen(self.pen)
+
+        # label
+        self.label = QGraphicsTextItem(label_text, self)
         self.updatePath()
 
     def updatePath(self):
@@ -236,17 +251,54 @@ class EdgeItem(QGraphicsPathItem):
         self.label.setDefaultTextColor(QColor("#cbd5e1") if IS_DARK else QColor("#334155"))
         self.label.setPos((p1.x()+p2.x())/2, (p1.y()+p2.y())/2 - 10)
 
+    def shape(self):
+        stroker = QPainterPathStroker()
+        stroker.setWidth(12)
+        return stroker.createStroke(self.path())
+
     def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem, widget=None):
-        super().paint(painter, option, widget)
+        pen = QPen(self.pen)
+        if self.isSelected():
+            pen.setWidth(3)
+            pen.setColor(QColor("#60a5fa"))
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(self.path())
+
         path = self.path()
         end  = path.pointAtPercent(1.0)
         prev = path.pointAtPercent(0.99)
         base_len, spread = 12.0, 30.0
         l1 = QLineF(end, prev); l1.setLength(base_len); l1.setAngle(l1.angle() + spread)
         l2 = QLineF(end, prev); l2.setLength(base_len); l2.setAngle(l2.angle() - spread)
-        painter.setBrush(self.pen.color()); painter.setPen(Qt.NoPen)
+        painter.setBrush(pen.color()); painter.setPen(Qt.NoPen)
         tri = QPolygonF([end, l1.p2(), l2.p2()])
         painter.drawPolygon(tri)
+
+    def mouseDoubleClickEvent(self, event):
+        current = self.label.toPlainText()
+        text, ok = QInputDialog.getText(None, "Edit Relationship Label", "Label:", text=current)
+        if ok:
+            self.label.setPlainText(text)
+            if hasattr(self.scene(), "on_update_edge_label") and callable(self.scene().on_update_edge_label):
+                self.scene().on_update_edge_label(self, text)
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event):
+        from PySide6.QtWidgets import QMenu
+        m = QMenu()
+        act_del = m.addAction("Delete Edge")
+        chosen = m.exec(event.screenPos().toPoint())
+        if chosen == act_del:
+            sc = self.scene()
+            if hasattr(sc, "on_delete_edge") and callable(sc.on_delete_edge):
+                sc.on_delete_edge(self)
+            sc.removeItem(self)
+            if hasattr(sc, "edges"):
+                try:
+                    sc.edges.remove(self)
+                except ValueError:
+                    pass
 
 class NodeItem(QGraphicsRectItem):
     def __init__(self, model: NodeData):
@@ -275,7 +327,6 @@ class NodeItem(QGraphicsRectItem):
     def paint(self, painter: QPainter, option: QStyleOptionGraphicsItem, widget=None):
         r = self.rect(); radius = 12
 
-        # shadow
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setBrush(QColor(0,0,0, 160 if IS_DARK else 28))
@@ -283,7 +334,6 @@ class NodeItem(QGraphicsRectItem):
         painter.drawRoundedRect(r.adjusted(2,6,6,10), radius, radius)
         painter.restore()
 
-        # card
         bg = QColor("#111827") if IS_DARK else QColor("#ffffff")
         border_col = qt_color(GROUPS.get(self.model.group, {}).get("color", "#94a3b8"))
         painter.setRenderHint(QPainter.Antialiasing, True)
@@ -291,7 +341,6 @@ class NodeItem(QGraphicsRectItem):
         painter.setPen(QPen(border_col, 2))
         painter.drawRoundedRect(r, radius, radius)
 
-        # status pill
         status_col = STATUS_COLORS.get(self.model.status, STATUS_COLORS["unknown"])
         pill_text = f"{self.model.status.upper()} ({self.model.confidence}%)"
         painter.setFont(QFont("", 8))
@@ -303,24 +352,24 @@ class NodeItem(QGraphicsRectItem):
         painter.setPen(QColor("#ffffff"))
         painter.drawText(QRectF(pill_x, pill_y, pill_w, pill_h), Qt.AlignCenter, pill_text)
 
-        # text colors
         self.title.setDefaultTextColor(QColor("#e5e7eb") if IS_DARK else QColor("#111827"))
         self.tagsText.setDefaultTextColor(QColor("#94a3b8") if IS_DARK else QColor("#334155"))
         self.linksText.setDefaultTextColor(QColor("#cbd5e1") if IS_DARK else QColor("#475569"))
 
     def update_tags(self):
-        t = ", ".join(self.model.tags[:4]) + (" …" if len(self.model.tags) > 4 else "")
+        # read-only rendering from the node’s own tag list
+        tags_preview = list(self.model.tags)  # defensive copy
+        t = ", ".join(tags_preview[:4]) + (" …" if len(tags_preview) > 4 else "")
         self.tagsText.setPlainText(t)
 
     def update_attachments(self):
         parts = []
-        for a in self.model.attachments[:4]:
+        for a in list(self.model.attachments)[:4]:  # defensive copy
             badge = social_badge_for(a.url) or ""
             parts.append(f"{('['+badge+'] ') if badge else ''}{a.label or a.url}")
         self.linksText.setPlainText(", ".join(parts) + (" …" if len(self.model.attachments) > 4 else ""))
 
     def mousePressEvent(self, event):
-        # Only start edge linking when Shift is held
         if QApplication.keyboardModifiers() & Qt.ShiftModifier:
             sc = self.scene()
             if hasattr(sc, "edge_click"):
@@ -389,12 +438,11 @@ class GraphScene(QGraphicsScene):
         super().__init__()
         self.nodes: Dict[str, NodeItem] = {}
         self.edges: List[EdgeItem] = []
-        # Shift-click edge creation state
         self._edgeSource: Optional[NodeItem] = None
 
-        # Hooks set by MainWindow
         self.on_add_edge = None
         self.on_delete_edge = None
+        self.on_update_edge_label = None
 
     def add_node(self, nd: NodeData):
         item = NodeItem(nd); self.addItem(item); self.nodes[nd.id] = item; return item
@@ -409,12 +457,10 @@ class GraphScene(QGraphicsScene):
         for e in self.edges: e.updatePath()
 
     def edge_click(self, node_item: NodeItem):
-        # Step 1: choose source (Shift+click)
         if self._edgeSource is None:
             self._edgeSource = node_item
             node_item.setSelected(True)
             return
-        # Step 2: choose target (Shift+click another node)
         if node_item is self._edgeSource:
             self._edgeSource = None
             return
@@ -433,9 +479,8 @@ class GraphView(QGraphicsView):
         self.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
         self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
         self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
-        self.setDragMode(QGraphicsView.ScrollHandDrag)  # hand-pan default
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
 
-        # overlay zoom controls
         self.controls = QWidget(self); self.controls.setAttribute(Qt.WA_TransparentForMouseEvents, False)
         self.controls.setStyleSheet("""
             QWidget { background: rgba(2,6,23,0.75); border: 1px solid #334155; border-radius: 12px; }
@@ -450,7 +495,6 @@ class GraphView(QGraphicsView):
         fit.clicked.connect(self.fit_to_items)
         self.controls.resize(140, 36)
 
-        # Shift-hint label
         self.hint = QLabel("Hold Shift: click source → target to connect")
         self.hint.setStyleSheet("color:#e5e7eb; background:rgba(2,6,23,0.65); padding:4px 8px; border-radius:8px;")
         self.hint.setParent(self)
@@ -509,7 +553,8 @@ class GraphView(QGraphicsView):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Orwellish – Local OSINT + D&D Node Editor (Python)")
+        self._syncing = False
+        self.setWindowTitle("Local OSINT + D&D Node Editor")
         self.resize(1400, 900)
 
         self.graph = GraphData()
@@ -520,6 +565,7 @@ class MainWindow(QMainWindow):
         # hooks for scene <-> model
         self.scene.on_add_edge = self._model_add_edge
         self.scene.on_delete_edge = self._model_delete_edge
+        self.scene.on_update_edge_label = self._model_update_edge_label
 
         self.inspector = self.build_inspector()
         splitter = QSplitter(); splitter.addWidget(self.view); splitter.addWidget(self.inspector)
@@ -535,7 +581,6 @@ class MainWindow(QMainWindow):
         importAct = QAction("Import JSON", self); importAct.triggered.connect(self.import_json); tb.addAction(importAct)
         exportAct = QAction("Export JSON", self); exportAct.triggered.connect(self.export_json); tb.addAction(exportAct)
         tb.addSeparator()
-        # Theme toggle (Ctrl+D)
         self.themeAct = QAction("Dark Mode", self); self.themeAct.setCheckable(True); self.themeAct.setChecked(IS_DARK)
         self.themeAct.setShortcut(QKeySequence("Ctrl+D")); self.themeAct.toggled.connect(self.toggle_theme)
         self.addAction(self.themeAct); tb.addAction(self.themeAct)
@@ -579,7 +624,7 @@ class MainWindow(QMainWindow):
         self.enrichBtn = QPushButton("Auto-Enrich (local Python)"); layout.addWidget(self.enrichBtn)
         layout.addStretch()
 
-        # connections
+        # connections (only user edits trigger textEdited)
         self.nameEdit.textEdited.connect(self.update_selected_from_ui)
         self.groupBox.currentIndexChanged.connect(self.update_selected_from_ui)
         self.statusBox.currentIndexChanged.connect(self.update_selected_from_ui)
@@ -616,18 +661,37 @@ class MainWindow(QMainWindow):
 
     def sync_inspector(self):
         it = self.current_node_item()
-        if not it: return
+        if not it:
+            return
         nd = it.model
+
+        # prevent update_selected_from_ui() from running while we refresh fields
+        self._syncing = True
+
+        # block signals on all inputs that can trigger update_selected_from_ui
+        widgets = [self.nameEdit, self.groupBox, self.statusBox, self.confEdit, self.tagsEdit, self.notesEdit]
+        for w in widgets:
+            w.blockSignals(True)
+
+        # write values (order no longer matters because signals are blocked)
         self.nameEdit.setText(nd.label)
         self.groupBox.setCurrentIndex(self.groupBox.findData(nd.group))
         self.statusBox.setCurrentText(nd.status)
         self.confEdit.setText(str(nd.confidence))
-        self.tagsEdit.setText(", ".join(nd.tags))
-        self.notesEdit.blockSignals(True); self.notesEdit.setPlainText(nd.notes or ""); self.notesEdit.blockSignals(False)
+        self.tagsEdit.setText(", ".join(list(nd.tags)))  # copy for safety
+        self.notesEdit.setPlainText(nd.notes or "")
+
         self.attachList.clear()
-        for a in nd.attachments:
+        for a in list(nd.attachments):
             badge = social_badge_for(a.url) or ""
             QListWidgetItem(f"{('['+badge+'] ') if badge else ''}{a.label}  |  {a.url}", self.attachList)
+
+        # unblock signals
+        for w in widgets:
+            w.blockSignals(False)
+
+        self._syncing = False
+
 
     def apply_search(self, text: str):
         q = (text or "").strip().lower()
@@ -654,13 +718,17 @@ class MainWindow(QMainWindow):
         it = self.current_node_item()
         if not it: return
         nd = it.model
+        # write back with defensive copies
         nd.label = self.nameEdit.text().strip() or "Untitled"
         nd.group = self.groupBox.currentData()
         nd.status = self.statusBox.currentText()
         try: nd.confidence = max(0, min(100, int(self.confEdit.text())))
         except Exception: nd.confidence = 50
-        nd.tags = [t.strip() for t in self.tagsEdit.text().split(",") if t.strip()]
-        nd.notes = self.notesEdit.toPlainText()
+        # TAGS: split -> unique -> sorted (copy)
+        tags = [t.strip() for t in self.tagsEdit.text().split(",") if t.strip()]
+        nd.tags = list(dict.fromkeys(tags))  # unique & copy
+        nd.notes = str(self.notesEdit.toPlainText())
+
         it.title.setPlainText(nd.label)
         it.update_tags(); it.update_attachments()
         it.update()
@@ -724,7 +792,7 @@ class MainWindow(QMainWindow):
         if nd.group == "person" and nd.label:
             for att in urls_for_person(nd.label):
                 if not any(att.url == a.url for a in nd.attachments):
-                    nd.attachments.append(att)
+                    nd.attachments.append(Attachment(label=att.label, url=att.url))  # rewrap => new objects
 
         if nd.group in ("domain","url"):
             target = nd.label
@@ -737,28 +805,31 @@ class MainWindow(QMainWindow):
                 w = whois_domain(target)
                 if w.get("registrar"):
                     tag = f"registrar:{w['registrar']}"
-                    if tag not in nd.tags: nd.tags.append(tag)
+                    if tag not in nd.tags: nd.tags = nd.tags + [tag]  # new list
                 for ns in w.get("name_servers", []):
                     tag = f"ns:{ns}"
-                    if tag not in nd.tags: nd.tags.append(tag)
+                    if tag not in nd.tags: nd.tags = nd.tags + [tag]
                 for k, vals in dns_records(target).items():
                     for v in vals:
                         tag = f"dns:{k}:{v}"
-                        if tag not in nd.tags: nd.tags.append(tag)
+                        if tag not in nd.tags: nd.tags = nd.tags + [tag]
                 for fav in urls_for_domain(target):
                     if not any(fav.url == a.url for a in nd.attachments):
-                        nd.attachments.append(fav)
+                        nd.attachments.append(Attachment(label=fav.label, url=fav.url))
 
         if nd.group == "ip":
             for att in urls_for_ip(nd.label):
                 if not any(att.url == a.url for a in nd.attachments):
-                    nd.attachments.append(att)
+                    nd.attachments.append(Attachment(label=att.label, url=att.url))
 
         emails = self.extract_emails(nd)
         if emails:
+            # extend via new list to avoid in-place sharing
+            new_tags = list(nd.tags)
             for e in emails:
-                tag = f"email:{e}"
-                if tag not in nd.tags: nd.tags.append(tag)
+                t = f"email:{e}"
+                if t not in new_tags: new_tags.append(t)
+            nd.tags = new_tags
             if nd.status == "unknown": nd.status = "suspected"
             nd.confidence = max(nd.confidence, 60)
 
@@ -778,9 +849,16 @@ class MainWindow(QMainWindow):
         lab = edge_item.label.toPlainText()
         self.graph.edges = [e for e in self.graph.edges if not (e.source == src_id and e.target == dst_id and e.label == lab)]
 
+    def _model_update_edge_label(self, edge_item: EdgeItem, new_text: str):
+        src_id = edge_item.src.model.id
+        dst_id = edge_item.dst.model.id
+        for e in self.graph.edges:
+            if e.source == src_id and e.target == dst_id:
+                e.label = new_text
+                break
+
     # ----- Deletion & shortcuts -----
     def keyPressEvent(self, e):
-        # Delete edges or nodes
         if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             removed = False
             # remove selected edges
@@ -805,7 +883,6 @@ class MainWindow(QMainWindow):
                     removed = True
             if removed: return
 
-        # Fit / Zoom
         if e.key() == Qt.Key_F:
             self.view.fit_to_items(); return
         if e.key() in (Qt.Key_Plus, Qt.Key_Equal):
@@ -830,11 +907,23 @@ class MainWindow(QMainWindow):
     def export_json(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export JSON", "mindmap.json", "JSON (*.json)")
         if not path: return
+        # update node positions before save
         for nd in self.graph.nodes:
             item = self.scene.nodes.get(nd.id)
             if item:
                 pos = item.pos(); nd.x, nd.y = pos.x(), pos.y()
-        data = { "nodes": [asdict(n) for n in self.graph.nodes], "edges": [asdict(e) for e in self.graph.edges] }
+        # deep-ish copy to avoid sharing on re-import
+        data = {
+            "nodes": [
+                {
+                    **asdict(n),
+                    "tags": list(n.tags),
+                    "attachments": [asdict(Attachment(a.label, a.url)) for a in n.attachments],
+                }
+                for n in self.graph.nodes
+            ],
+            "edges": [asdict(e) for e in self.graph.edges]
+        }
         with open(path, "w", encoding="utf-8") as f: json.dump(data, f, indent=2)
         QMessageBox.information(self, "Export", f"Saved to {path}")
 
@@ -845,11 +934,29 @@ class MainWindow(QMainWindow):
             with open(path, "r", encoding="utf-8") as f: data = json.load(f)
             self.scene.clear(); self.scene.nodes.clear(); self.scene.edges.clear()
             self.graph.nodes, self.graph.edges = [], []
+
             for n in data.get("nodes", []):
-                nd = NodeData(**{ **n, "attachments": [Attachment(**a) for a in n.get("attachments", [])] })
-                self.graph.nodes.append(nd); self.scene.add_node(nd)
+                nd = NodeData(
+                    id=n.get("id",""),
+                    label=n.get("label","Untitled"),
+                    group=n.get("group","note"),
+                    # **copy** lists to ensure isolation
+                    tags=list(n.get("tags", [])),
+                    status=n.get("status","unknown"),
+                    confidence=int(n.get("confidence", 50)),
+                    attachments=[Attachment(**a) for a in n.get("attachments", [])],
+                    notes=n.get("notes",""),
+                    x=float(n.get("x", 0.0)),
+                    y=float(n.get("y", 0.0)),
+                )
+                self.graph.nodes.append(nd)
+                self.scene.add_node(nd)
+
             for e in data.get("edges", []):
-                ed = EdgeData(**e); self.graph.edges.append(ed); self.scene.add_edge(ed)
+                ed = EdgeData(**e)
+                self.graph.edges.append(ed)
+                self.scene.add_edge(ed)
+
             QMessageBox.information(self, "Import", f"Loaded {len(self.graph.nodes)} nodes.")
         except Exception as e:
             QMessageBox.critical(self, "Import error", str(e))
@@ -857,14 +964,39 @@ class MainWindow(QMainWindow):
 # ----------------------------
 # Entry
 # ----------------------------
+def set_safe_app_font(app: QApplication):
+    """
+    Force a modern, scalable UI font so Qt doesn't fall back to legacy 'MS Sans Serif'.
+    Tries system fonts first; if none found, stays with Qt default.
+    """
+    preferred = []
+    if platform.system() == "Windows":
+        preferred = ["Segoe UI", "Arial", "Tahoma", "Verdana"]
+    elif platform.system() == "Darwin":
+        preferred = ["SF Pro Text", "Helvetica Neue", "Helvetica", "Arial"]
+    else:
+        preferred = ["Noto Sans", "DejaVu Sans", "Liberation Sans", "Arial"]
 
+    available = set(QFontDatabase.families())
+    for fam in preferred:
+        if fam in available:
+            app.setFont(QFont(fam, 10))   # 10pt is a comfortable default
+            return
+
+    # Last resort: if Arial is present under a slightly different name
+    for fam in available:
+        if "arial" in fam.lower():
+            app.setFont(QFont(fam, 10))
+            return
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    set_safe_app_font(app)          # <-- add this line
+
     if IS_DARK: apply_dark_palette(app)
     apply_qss(app, IS_DARK)
     w = MainWindow(); w.show()
     sys.exit(app.exec())
-
 if __name__ == "__main__":
     main()
