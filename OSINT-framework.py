@@ -1,15 +1,13 @@
-import json, math, os, re, sys, webbrowser
+
+import json, os, re, sys, webbrowser
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any
 
 import requests, tldextract, validators, dns.resolver, whois
-from PIL import Image
-from io import BytesIO
-
-from PySide6.QtCore import Qt, QPointF, QRectF, QMimeData, QUrl, QSize, QLineF
+from PySide6.QtCore import Qt, QPointF, QRectF, QMimeData, QUrl, QSize, QLineF, QTimer
 from PySide6.QtGui import (
     QAction, QBrush, QColor, QFont, QPainter, QPainterPath, QPen,
-    QPixmap, QTransform, QPolygonF, QPalette, QKeySequence
+    QPixmap, QPolygonF, QPalette, QKeySequence
 )
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QGraphicsItem, QGraphicsPathItem, QGraphicsRectItem,
@@ -53,7 +51,7 @@ SOCIAL_HOST_BADGES = {
 }
 
 # --- Theme state ---
-IS_DARK = True  # start in dark mode
+IS_DARK = True
 
 def apply_dark_palette(app: QApplication):
     pal = QPalette()
@@ -322,11 +320,13 @@ class NodeItem(QGraphicsRectItem):
         self.linksText.setPlainText(", ".join(parts) + (" …" if len(self.model.attachments) > 4 else ""))
 
     def mousePressEvent(self, event):
-        sc = self.scene()
-        if hasattr(sc, "edgeMode") and sc.edgeMode:
-            sc.edge_click(self)
-            event.accept()
-            return
+        # Only start edge linking when Shift is held
+        if QApplication.keyboardModifiers() & Qt.ShiftModifier:
+            sc = self.scene()
+            if hasattr(sc, "edge_click"):
+                sc.edge_click(self)
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event):
@@ -389,9 +389,9 @@ class GraphScene(QGraphicsScene):
         super().__init__()
         self.nodes: Dict[str, NodeItem] = {}
         self.edges: List[EdgeItem] = []
-        # Edge creation tool state
-        self.edgeMode: bool = False
+        # Shift-click edge creation state
         self._edgeSource: Optional[NodeItem] = None
+
         # Hooks set by MainWindow
         self.on_add_edge = None
         self.on_delete_edge = None
@@ -408,12 +408,13 @@ class GraphScene(QGraphicsScene):
     def update_edges(self):
         for e in self.edges: e.updatePath()
 
-    # Edge tool flow: source -> target
     def edge_click(self, node_item: NodeItem):
+        # Step 1: choose source (Shift+click)
         if self._edgeSource is None:
             self._edgeSource = node_item
             node_item.setSelected(True)
             return
+        # Step 2: choose target (Shift+click another node)
         if node_item is self._edgeSource:
             self._edgeSource = None
             return
@@ -449,9 +450,19 @@ class GraphView(QGraphicsView):
         fit.clicked.connect(self.fit_to_items)
         self.controls.resize(140, 36)
 
+        # Shift-hint label
+        self.hint = QLabel("Hold Shift: click source → target to connect")
+        self.hint.setStyleSheet("color:#e5e7eb; background:rgba(2,6,23,0.65); padding:4px 8px; border-radius:8px;")
+        self.hint.setParent(self)
+        self.hint.adjustSize()
+        self.hint.hide()
+        self._hintTimer = QTimer(self); self._hintTimer.setInterval(1500); self._hintTimer.setSingleShot(True)
+        self._hintTimer.timeout.connect(self.hint.hide)
+
     def resizeEvent(self, e):
         super().resizeEvent(e)
         self.controls.move(12, self.viewport().height() - self.controls.height() - 12)
+        self.hint.move(12, self.viewport().height() - self.controls.height() - 12 - self.hint.height() - 8)
 
     def fit_to_items(self):
         rect = self.scene().itemsBoundingRect()
@@ -465,10 +476,15 @@ class GraphView(QGraphicsView):
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Space:
             self._prev = self.dragMode(); self.setDragMode(QGraphicsView.ScrollHandDrag); return
+        if e.key() == Qt.Key_Shift:
+            self.hint.show(); self._hintTimer.start()
         super().keyPressEvent(e)
+
     def keyReleaseEvent(self, e):
         if e.key() == Qt.Key_Space:
             self.setDragMode(getattr(self, "_prev", QGraphicsView.ScrollHandDrag)); return
+        if e.key() == Qt.Key_Shift:
+            self._hintTimer.start()
         super().keyReleaseEvent(e)
 
     def drawBackground(self, painter: QPainter, rect: QRectF):
@@ -519,15 +535,10 @@ class MainWindow(QMainWindow):
         importAct = QAction("Import JSON", self); importAct.triggered.connect(self.import_json); tb.addAction(importAct)
         exportAct = QAction("Export JSON", self); exportAct.triggered.connect(self.export_json); tb.addAction(exportAct)
         tb.addSeparator()
-        # Theme toggle
+        # Theme toggle (Ctrl+D)
         self.themeAct = QAction("Dark Mode", self); self.themeAct.setCheckable(True); self.themeAct.setChecked(IS_DARK)
         self.themeAct.setShortcut(QKeySequence("Ctrl+D")); self.themeAct.toggled.connect(self.toggle_theme)
         self.addAction(self.themeAct); tb.addAction(self.themeAct)
-        # Edge tool toggle
-        self.edgeAct = QAction("Create Edge", self); self.edgeAct.setCheckable(True)
-        self.edgeAct.setShortcut(QKeySequence("E"))
-        self.edgeAct.toggled.connect(self.toggle_edge_mode)
-        self.addAction(self.edgeAct); tb.addAction(self.edgeAct)
 
         self.seed_example()
         self.scene.selectionChanged.connect(self.sync_inspector)
@@ -755,14 +766,7 @@ class MainWindow(QMainWindow):
         self.sync_inspector()
         QMessageBox.information(self, "Enrich", "Enrichment complete.")
 
-    # ----- Edge tool & delete -----
-    def toggle_edge_mode(self, on: bool):
-        self.scene.edgeMode = bool(on)
-        if not on: self.scene._edgeSource = None
-        if on:
-            QMessageBox.information(self, "Create Edge",
-                "Click a source node, then a target node to connect them.\nPress 'E' again to exit edge mode.")
-
+    # ----- Model sync for edges -----
     def _model_add_edge(self, ed: EdgeData):
         if any(e.source == ed.source and e.target == ed.target and e.label == ed.label for e in self.graph.edges):
             return
@@ -774,17 +778,41 @@ class MainWindow(QMainWindow):
         lab = edge_item.label.toPlainText()
         self.graph.edges = [e for e in self.graph.edges if not (e.source == src_id and e.target == dst_id and e.label == lab)]
 
+    # ----- Deletion & shortcuts -----
     def keyPressEvent(self, e):
+        # Delete edges or nodes
         if e.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             removed = False
+            # remove selected edges
             for it in list(self.scene.selectedItems()):
                 if isinstance(it, EdgeItem):
-                    if callable(self.scene.on_delete_edge):
-                        self.scene.on_delete_edge(it)
+                    if callable(self.scene.on_delete_edge): self.scene.on_delete_edge(it)
                     self.scene.removeItem(it)
                     if it in self.scene.edges: self.scene.edges.remove(it)
                     removed = True
+            # remove selected nodes (and their edges)
+            for it in list(self.scene.selectedItems()):
+                if isinstance(it, NodeItem):
+                    nid = it.model.id
+                    for ed in list(self.scene.edges):
+                        if ed.src is it or ed.dst is it:
+                            if callable(self.scene.on_delete_edge): self.scene.on_delete_edge(ed)
+                            self.scene.removeItem(ed)
+                            if ed in self.scene.edges: self.scene.edges.remove(ed)
+                    self.scene.removeItem(it)
+                    self.scene.nodes.pop(nid, None)
+                    self.graph.nodes = [n for n in self.graph.nodes if n.id != nid]
+                    removed = True
             if removed: return
+
+        # Fit / Zoom
+        if e.key() == Qt.Key_F:
+            self.view.fit_to_items(); return
+        if e.key() in (Qt.Key_Plus, Qt.Key_Equal):
+            self.view.scale(1.15, 1.15); return
+        if e.key() in (Qt.Key_Minus, Qt.Key_Underscore):
+            self.view.scale(1/1.15, 1/1.15); return
+
         super().keyPressEvent(e)
 
     # ----- Theme toggle -----
