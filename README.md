@@ -11,14 +11,13 @@
 
 📨 Automatic email detection inside labels/attachments
 
-🕵️ Contextual OSINT shortcuts (e.g., WHOIS, Shodan, LinkedIn, HIBP)
+
 
 🧭 Drag & drop files or URLs to auto-create nodes
 
 🪄 JSON import/export + local autosave
 
-⚡ Optional Python backend for enrichment (e.g., WHOIS lookups, scraping, tagging)
-🖱️ Canvas Interaction
+
 
 
 
