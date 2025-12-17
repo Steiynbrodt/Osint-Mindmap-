@@ -75,12 +75,5 @@ Ctrl/Cmd + S	Export JSON
 Ctrl/Cmd + O	Import JSON
 Space (hold)	Hand tool / pan
 1 / 2 / 3	Edge style: solid / dashed / dotted
-🧠 OSINT Automation (Optional)
 
-If the Python backend is running (http://127.0.0.1:8795 by default), you can:
 
-Enrich selected node with WHOIS/DNS/IP lookups.
-
-Auto-add tags, status, confidence, and attachments.
-
-Extend backend with your own enrichment scripts.
